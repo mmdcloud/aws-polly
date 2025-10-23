@@ -1,31 +1,23 @@
 import os
+import json
 import logging
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from cachetools import TTLCache
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 # Configure Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-logger = logging.getLogger(__name__)
-
-# Initialize cache (avoid re-synthesizing the same text)
+# Initialize cache (persists across warm Lambda invocations)
 audio_cache = TTLCache(maxsize=500, ttl=3600)  # 1-hour TTL
 
-# Initialize Polly client
-polly = boto3.client("polly", region_name=os.getenv("AWS_DEFAULT_REGION"))
-
-# Optional: S3 client for storing audio files
+# Initialize AWS clients (reused across invocations)
+polly = boto3.client("polly")
 s3 = boto3.client("s3")
-S3_BUCKET = os.getenv("S3_BUCKET")
 
+# Environment variables
+S3_BUCKET = os.getenv("S3_BUCKET")
 
 def synthesize_speech(text, voice_id="Joanna", output_format="mp3", s3_key=None):
     """
@@ -62,7 +54,7 @@ def synthesize_speech(text, voice_id="Joanna", output_format="mp3", s3_key=None)
         # 4. Optionally upload to S3
         if s3_key:
             s3.upload_file(local_path, S3_BUCKET, s3_key)
-            s3_url = f"s3://{S3_BUCKET}/{s3_key}"
+            s3_url = f"https://{S3_BUCKET}.s3.amazonaws.com/{s3_key}"
             logger.info("Audio uploaded to S3: %s", s3_url)
         else:
             s3_url = None
@@ -80,10 +72,93 @@ def synthesize_speech(text, voice_id="Joanna", output_format="mp3", s3_key=None)
         raise
 
 
-if __name__ == "__main__":
-    text_input = "Welcome to the production-grade Amazon Polly demo!"
-    result = synthesize_speech(text_input, voice_id="Matthew", s3_key="demo/audio1.mp3")
+def lambda_handler(event, context):
+    """
+    AWS Lambda handler function.
+    
+    Expected event structure:
+    {
+        "text": "Text to synthesize",
+        "voice_id": "Joanna",
+        "output_format": "mp3",
+        "s3_key": "texttospeech.mp3"
+    }
+    """
+    try:
+        # Parse input from event
+        if isinstance(event.get("body"), str):
+            # API Gateway format
+            body = json.loads(event["body"])
+        else:
+            # Direct invocation
+            body = event
 
-    print(f"Generated file: {result['file']}")
-    if result["s3_url"]:
-        print(f"Stored in S3: {result['s3_url']}")
+        # Extract parameters
+        text = body.get("text")
+        if not text:
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"error": "Missing required parameter: text"})
+            }
+
+        voice_id = body.get("voice_id", "Joanna")
+        output_format = body.get("output_format", "mp3")
+        s3_key = body.get("s3_key")
+
+        # Validate parameters
+        if len(text) > 3000:
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"error": "Text exceeds maximum length of 3000 characters"})
+            }
+
+        # Synthesize speech
+        result = synthesize_speech(
+            text=text,
+            voice_id=voice_id,
+            output_format=output_format,
+            s3_key=s3_key
+        )
+
+        # Return success response
+        response_body = {
+            "message": "Speech synthesis completed successfully",
+            "voice_id": voice_id,
+            "output_format": output_format,
+            "local_path": result["file"]
+        }
+
+        if result.get("s3_url"):
+            response_body["s3_url"] = result["s3_url"]
+
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(response_body)
+        }
+
+    except ValueError as e:
+        logger.error("Validation error: %s", e)
+        return {
+            "statusCode": 400,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": str(e)})
+        }
+
+    except (BotoCoreError, ClientError) as e:
+        logger.error("AWS service error: %s", e, exc_info=True)
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "AWS service error occurred"})
+        }
+
+    except Exception as e:
+        logger.error("Unexpected error in lambda_handler: %s", e, exc_info=True)
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Internal server error"})
+        }
